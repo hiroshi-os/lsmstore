@@ -1,0 +1,14 @@
+/data
+/bin
+*.test
+*.out
+coverage.out
+.idea
+.vscode
+*.exe
+cmd/lsmstore/lsmstore
+cmd/lsmctl/lsmctl
+cmd/lsmbench/lsmbench
+/lsmstore
+/lsmctl
+/lsmbench
