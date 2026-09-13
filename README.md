@@ -1,0 +1,3 @@
+# lsmstore
+
+Bootstrap — MVP incoming.
