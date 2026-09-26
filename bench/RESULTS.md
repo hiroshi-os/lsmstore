@@ -22,9 +22,9 @@ Historical write-RPS rows in the README / DESIGN.md (2026-09-13) were measured o
 command:
   LSMSTORE_CRASH_RUNS=220 go test ./internal/lsm/ -run TestCrashKill9 -count=1 -timeout 60m -v
 
-tree:        working tree on branch cursor/lsm-durability-ci-0424 immediately before
-             the commit that added bench/RESULTS.md (includes deferred WAL delete,
-             CRC length coverage, torn-tail truncation, crash + property tests)
+tree:        commit 9f956184591352ea3176a81648137229962f4fce
+             (branch cursor/lsm-durability-ci-0424; crash suite was run on this
+             tree immediately before the RESULTS.md SHA line was filled in)
 
 result line:
   CRASH_RESULT runs=220 lost_writes=0 torn_tail_runs=0 torn_tails=0 truncated_bytes=0 acked_ops=8428
