@@ -126,6 +126,19 @@ func (db *DB) runCompaction(job *compactJob) error {
 	if err := finishWriter(); err != nil {
 		return err
 	}
+	for _, it := range opened {
+		if err := it.Err(); err != nil {
+			if writer != nil {
+				writer.Abort()
+			}
+			for _, t := range outputs {
+				p := t.Path()
+				_ = t.Close()
+				_ = os.Remove(p)
+			}
+			return err
+		}
+	}
 
 	return db.installCompaction(job, outputs)
 }
@@ -160,7 +173,7 @@ func (db *DB) installCompaction(job *compactJob, outputs []*SSTable) error {
 	})
 	next.retainAll()
 
-	if err := writeManifest(db.opts.Dir, next.toManifest(db.nextFile.Load(), db.seq.Load())); err != nil {
+	if err := writeManifest(db.opts.Dir, next.toManifest(db.nextFile.Load(), db.seq.Load(), db.obsoleteWALs)); err != nil {
 		next.release()
 		for _, t := range outputs {
 			_ = os.Remove(t.path)

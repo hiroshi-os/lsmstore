@@ -37,9 +37,12 @@ Crash windows:
 | --- | --- |
 | WAL append + memtable, before flush | Replay WAL into a new memtable |
 | SST write, before MANIFEST rename | Orphan `.sst` / `.tmp` ignored; WAL still replays |
-| MANIFEST rename, before WAL delete | SST loaded and WAL replayed; memtable shadows the SST |
+| MANIFEST rename, before WAL delete | SST loaded; obsolete WALs removed only after that MANIFEST is observed on Open |
+| WAL still present after flush | SST loaded and WAL replayed; memtable shadows the SST |
 
-A torn WAL record at EOF is treated as a crash mid-append and discarded (CRC + length check).
+Obsolete WAL segments are **not** unlinked during `flushOne`. Their numbers are recorded in `MANIFEST.obsolete_wal_nums` and removed on the next successful `Open` after those SSTables open. That closes a window where a rolled-back directory entry for MANIFEST plus an already-deleted WAL would lose acknowledged writes (observed under kill on Windows).
+
+A torn WAL record at EOF is truncated to the last complete CRC-valid frame (length+payload checksum). Mid-file corruption with a valid suffix fails open.
 
 ## Read path
 
@@ -67,13 +70,13 @@ Caller key/value slices are copied on the way in. `Freeze()` forbids further wri
 File: `NNNNNN.log` in the DB directory.
 
 ```
-record = crc32(payload) || u32(len) || payload
+record = crc32(len || payload) || u32(len) || payload
 payload = type:u8 || seq:u64 || klen:u32 || vlen:u32 || key || value
 ```
 
-`SyncWAL=true` (default on the HTTP/CLI servers) calls `fsync` after every append. That is the durable configuration. Benchmarks also report the buffered (`SyncWAL=false`) number so the CPU/skiplist path is visible without being dominated by the disk barrier.
+`SyncWAL=true` (default on the HTTP/CLI servers) calls `fsync` after every append. That is the durable configuration. Opening a new WAL also syncs the parent directory on Unix so the file's directory entry is durable before any acknowledged record can land in it. Benchmarks also report the buffered (`SyncWAL=false`) number so the CPU/skiplist path is visible without being dominated by the disk barrier.
 
-Replay scans `*.log` in file-number order. Older seqs that lose to a newer in-memory entry are ignored by the skiplist upsert.
+Replay scans `*.log` in file-number order. A torn frame at EOF (short header/body, implausible length past EOF, or a CRC failure with no valid frames after it) is truncated to the last good offset and counted in `RecoveryInfo`. A mid-file CRC failure that is followed by a valid frame suffix fails `Open` instead of silently truncating. Older seqs that lose to a newer in-memory entry are ignored by the skiplist upsert.
 
 ## SSTable format
 
@@ -182,3 +185,5 @@ The durable number is expected to sit near the filesystem’s fsync rate (often 
 - No compression, checksums on SST data blocks, or table cache
 - No partitioned / hashed memtables
 - No Raft, multi-disk, or multi-process locking (`lsmctl` and `lsmstore` must not share a live directory)
+- Directory-entry fsync is a no-op on Windows (file data Sync still runs); Unix CI is the durability bar for rename/create
+- Group commit / concurrent writers on the WAL are not optimized; writers serialize on `DB.mu`

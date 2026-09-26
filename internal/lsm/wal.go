@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -15,15 +16,34 @@ import (
 
 const walMagic = uint32(0x4c534d57) // "LSMW"
 
-// WAL is an append-only durability log. Each record is:
+// WAL frame:
 //
-//	crc32 | payloadLen | type | seq | klen | vlen | key | value
+//	crc32(len || payload) | u32(len) | payload
+//	payload = type:u8 | seq:u64 | klen:u32 | vlen:u32 | key | value
+//
+// The checksum covers the length so a torn length field cannot frame a
+// different byte slice that still matches the stored CRC.
+
+const (
+	walHeaderLen = 8
+	walMinRecord = 17
+	walMaxRecord = 1 << 26
+)
+
+// WAL is an append-only durability log.
 type WAL struct {
 	mu   sync.Mutex
 	f    *os.File
 	dir  string
 	num  uint64
 	sync bool
+}
+
+// WALReplay is the result of scanning every log in a directory.
+type WALReplay struct {
+	MaxNum         uint64
+	TornTails      int
+	TruncatedBytes int64
 }
 
 func walPath(dir string, num uint64) string {
@@ -39,28 +59,40 @@ func OpenWAL(dir string, num uint64, sync bool) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The directory entry must be durable before any fsynced record in this
+	// file can be acknowledged. File data sync does not cover the dirent.
+	if err := syncDir(dir); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	return &WAL{f: f, dir: dir, num: num, sync: sync}, nil
 }
 
 func (w *WAL) Num() uint64 { return w.num }
 
 func (w *WAL) Append(rec Record) error {
-	payload := encodeWALPayload(rec)
-	hdr := make([]byte, 8)
-	binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(payload)))
-	crc := crc32.ChecksumIEEE(payload)
-	binary.LittleEndian.PutUint32(hdr[0:4], crc)
-
+	buf := encodeWALFrame(rec)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, err := w.f.Write(hdr); err != nil {
+	if w.f == nil {
+		return errors.New("wal: closed")
+	}
+	st, err := w.f.Stat()
+	if err != nil {
 		return err
 	}
-	if _, err := w.f.Write(payload); err != nil {
+	end := st.Size()
+	if err := writeFull(w.f, buf); err != nil {
+		// Roll the file back so a later successful append cannot land
+		// after a torn frame. Replay stops at the first bad frame.
+		_ = w.f.Truncate(end)
+		_ = w.f.Sync()
 		return err
 	}
 	if w.sync {
-		return w.f.Sync()
+		if err := w.f.Sync(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -68,6 +100,9 @@ func (w *WAL) Append(rec Record) error {
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.f == nil {
+		return errors.New("wal: closed")
+	}
 	return w.f.Sync()
 }
 
@@ -103,19 +138,42 @@ func encodeWALPayload(rec Record) []byte {
 	return buf
 }
 
+func encodeWALFrame(rec Record) []byte {
+	payload := encodeWALPayload(rec)
+	buf := make([]byte, walHeaderLen+len(payload))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(buf[0:4], checksumWAL(payload))
+	copy(buf[8:], payload)
+	return buf
+}
+
+func checksumWAL(payload []byte) uint32 {
+	var lenb [4]byte
+	binary.LittleEndian.PutUint32(lenb[:], uint32(len(payload)))
+	h := crc32.NewIEEE()
+	_, _ = h.Write(lenb[:])
+	_, _ = h.Write(payload)
+	return h.Sum32()
+}
+
 func decodeWALPayload(p []byte) (Record, error) {
-	if len(p) < 17 {
+	if len(p) < walMinRecord {
 		return Record{}, io.ErrUnexpectedEOF
 	}
 	rec := Record{
 		Type: RecordType(p[0]),
 		Seq:  binary.LittleEndian.Uint64(p[1:9]),
 	}
-	klen := int(binary.LittleEndian.Uint32(p[9:13]))
-	vlen := int(binary.LittleEndian.Uint32(p[13:17]))
-	if 17+klen+vlen != len(p) {
+	if rec.Type != RecordPut && rec.Type != RecordDel {
+		return Record{}, fmt.Errorf("wal: bad record type %d", rec.Type)
+	}
+	klenU := binary.LittleEndian.Uint32(p[9:13])
+	vlenU := binary.LittleEndian.Uint32(p[13:17])
+	if int64(klenU)+int64(vlenU)+int64(walMinRecord) != int64(len(p)) {
 		return Record{}, fmt.Errorf("wal: bad payload size")
 	}
+	klen := int(klenU)
+	vlen := int(vlenU)
 	rec.Key = cloneBytes(p[17 : 17+klen])
 	if vlen > 0 {
 		rec.Value = cloneBytes(p[17+klen : 17+klen+vlen])
@@ -123,67 +181,146 @@ func decodeWALPayload(p []byte) (Record, error) {
 	return rec, nil
 }
 
-// ReplayWAL walks every .log file in dir in file-number order.
-func ReplayWAL(dir string, fn func(Record) error) (maxNum uint64, err error) {
-	nums, err := listWALNums(dir)
+type frameKind int
+
+const (
+	frameOK frameKind = iota
+	frameTorn
+	frameBad
+)
+
+// readWALFrame parses one frame at off. frameTorn means the bytes from off
+// to EOF cannot be a complete record (short header, short body, or a length
+// that runs past EOF). frameBad means a complete slice was read but the CRC
+// or payload was invalid; next is the offset just past that slice.
+func readWALFrame(f *os.File, off, size int64) (Record, int64, frameKind, error) {
+	if size-off < walHeaderLen {
+		return Record{}, off, frameTorn, io.ErrUnexpectedEOF
+	}
+	var hdr [walHeaderLen]byte
+	if _, err := f.ReadAt(hdr[:], off); err != nil {
+		return Record{}, off, frameTorn, err
+	}
+	crcWant := binary.LittleEndian.Uint32(hdr[0:4])
+	n := int64(binary.LittleEndian.Uint32(hdr[4:8]))
+	if n < walMinRecord || n > walMaxRecord || off+walHeaderLen+n > size {
+		return Record{}, off, frameTorn, fmt.Errorf("wal: torn record at %d (len %d)", off, n)
+	}
+	payload := make([]byte, n)
+	if _, err := f.ReadAt(payload, off+walHeaderLen); err != nil {
+		return Record{}, off, frameTorn, err
+	}
+	next := off + walHeaderLen + n
+	if checksumWAL(payload) != crcWant {
+		return Record{}, next, frameBad, fmt.Errorf("wal: crc mismatch at %d", off)
+	}
+	rec, err := decodeWALPayload(payload)
 	if err != nil {
-		return 0, err
+		return Record{}, next, frameBad, err
 	}
-	for _, num := range nums {
-		if num > maxNum {
-			maxNum = num
-		}
-		if err := replayOne(walPath(dir, num), fn); err != nil {
-			return maxNum, fmt.Errorf("wal %d: %w", num, err)
-		}
-	}
-	return maxNum, nil
+	return rec, next, frameOK, nil
 }
 
-func replayOne(path string, fn func(Record) error) error {
-	f, err := os.Open(path)
+// suffixValid reports whether [off, size) is one or more complete, valid
+// frames and nothing else. An empty suffix is not valid: a checksum failure
+// on the last frame is a torn tail, not proof of a good record after it.
+func suffixValid(f *os.File, off, size int64) bool {
+	if off >= size {
+		return false
+	}
+	for off < size {
+		_, next, kind, _ := readWALFrame(f, off, size)
+		if kind != frameOK {
+			return false
+		}
+		if next <= off {
+			return false
+		}
+		off = next
+	}
+	return true
+}
+
+func truncateWAL(f *os.File, good, size int64) (int64, error) {
+	if err := f.Truncate(good); err != nil {
+		return 0, err
+	}
+	if err := f.Sync(); err != nil {
+		return 0, err
+	}
+	return size - good, nil
+}
+
+// ReplayWAL walks every .log file in dir in file-number order.
+// A torn tail (incomplete frame, or a CRC failure that is not followed by
+// a valid frame suffix) is truncated to the last good frame and counted.
+// A CRC failure followed by valid frames is returned as an error so a
+// mid-file checksum break is not silently dropped.
+func ReplayWAL(dir string, fn func(Record) error) (WALReplay, error) {
+	var out WALReplay
+	nums, err := listWALNums(dir)
+	if err != nil {
+		return out, err
+	}
+	for _, num := range nums {
+		if num > out.MaxNum {
+			out.MaxNum = num
+		}
+		torn, n, err := replayFile(walPath(dir, num), fn)
+		if torn {
+			out.TornTails++
+			out.TruncatedBytes += n
+		}
+		if err != nil {
+			return out, fmt.Errorf("wal %d: %w", num, err)
+		}
+	}
+	return out, nil
+}
+
+func replayFile(path string, fn func(Record) error) (torn bool, truncated int64, err error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return false, 0, nil
 		}
-		return err
+		return false, 0, err
 	}
 	defer f.Close()
-	hdr := make([]byte, 8)
-	for {
-		if _, err := io.ReadFull(f, hdr); err != nil {
-			if err == io.EOF {
-				return nil
+	st, err := f.Stat()
+	if err != nil {
+		return false, 0, err
+	}
+	size := st.Size()
+	var good int64
+	for good < size {
+		rec, next, kind, ferr := readWALFrame(f, good, size)
+		switch kind {
+		case frameOK:
+			if err := fn(rec); err != nil {
+				return false, 0, err
 			}
-			if err == io.ErrUnexpectedEOF {
-				// torn write at the end of the file — ignore
-				return nil
+			good = next
+		case frameTorn:
+			n, err := truncateWAL(f, good, size)
+			if err != nil {
+				return false, 0, err
 			}
-			return err
-		}
-		crcWant := binary.LittleEndian.Uint32(hdr[0:4])
-		n := int(binary.LittleEndian.Uint32(hdr[4:8]))
-		if n < 17 || n > 1<<26 {
-			return fmt.Errorf("wal: implausible record length %d", n)
-		}
-		payload := make([]byte, n)
-		if _, err := io.ReadFull(f, payload); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil
+			return true, n, nil
+		case frameBad:
+			if suffixValid(f, next, size) {
+				return false, 0, ferr
 			}
-			return err
-		}
-		if crc32.ChecksumIEEE(payload) != crcWant {
-			return fmt.Errorf("wal: crc mismatch")
-		}
-		rec, err := decodeWALPayload(payload)
-		if err != nil {
-			return err
-		}
-		if err := fn(rec); err != nil {
-			return err
+			n, err := truncateWAL(f, good, size)
+			if err != nil {
+				return false, 0, err
+			}
+			return true, n, nil
+		default:
+			return false, 0, ferr
 		}
 	}
+	return false, 0, nil
 }
 
 func listWALNums(dir string) ([]uint64, error) {
@@ -208,6 +345,65 @@ func listWALNums(dir string) ([]uint64, error) {
 	}
 	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
 	return nums, nil
+}
+
+// cleanupTempFiles removes leftover *.tmp files from a crashed writer.
+func cleanupTempFiles(dir string) (maxNum uint64, err error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var tmps []string
+	for _, e := range ents {
+		name := e.Name()
+		if n, ok := leadingFileNum(name); ok && n > maxNum {
+			maxNum = n
+		}
+		if strings.HasSuffix(name, ".tmp") {
+			tmps = append(tmps, name)
+		}
+	}
+	for _, name := range tmps {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			return maxNum, err
+		}
+	}
+	return maxNum, nil
+}
+
+func leadingFileNum(name string) (uint64, bool) {
+	i := 0
+	for i < len(name) && name[i] >= '0' && name[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(name) || name[i] != '.' {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(name[:i], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func maxDataFileNum(dir string) (uint64, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var maxNum uint64
+	for _, e := range ents {
+		if n, ok := leadingFileNum(e.Name()); ok && n > maxNum {
+			maxNum = n
+		}
+	}
+	return maxNum, nil
 }
 
 // unused but reserved for header validation

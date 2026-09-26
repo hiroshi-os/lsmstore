@@ -206,6 +206,14 @@ func (t *SSTable) loadMeta() error {
 	t.meta.NumEntries = binary.LittleEndian.Uint64(footer[32:40])
 	t.meta.Size = st.Size()
 
+	end := st.Size() - sstFooterLen
+	if t.indexOff < 0 || indexLen < 0 || t.indexOff > end || indexLen > end-t.indexOff {
+		return fmt.Errorf("sstable %s: index out of range", t.path)
+	}
+	if bloomLen < 0 || bloomOff < 0 || (bloomLen > 0 && (bloomOff > end || bloomLen > end-bloomOff)) {
+		return fmt.Errorf("sstable %s: bloom out of range", t.path)
+	}
+
 	idxBuf := make([]byte, indexLen)
 	if _, err := t.f.ReadAt(idxBuf, t.indexOff); err != nil {
 		return err
@@ -217,14 +225,15 @@ func (t *SSTable) loadMeta() error {
 	if len(t.index) > 0 {
 		t.meta.MinKey = cloneBytes(t.index[0].key)
 	}
-	bloomBuf := make([]byte, bloomLen)
 	if bloomLen > 0 {
+		bloomBuf := make([]byte, bloomLen)
 		if _, err := t.f.ReadAt(bloomBuf, bloomOff); err != nil {
 			return err
 		}
 		t.bloom = DecodeBloom(bloomBuf)
 	} else {
-		t.bloom = NewBloom(1, 10)
+		// A missing filter must not false-negative. MayContain(nil) is true.
+		t.bloom = nil
 	}
 	return nil
 }
@@ -286,11 +295,10 @@ func (w *sstWriter) Add(key, value []byte, seq uint64, deleted bool) error {
 		typ = RecordDel
 	}
 	buf := encodeSSTRecord(typ, seq, key, value)
-	n, err := w.f.Write(buf)
-	if err != nil {
+	if err := writeFull(w.f, buf); err != nil {
 		return err
 	}
-	w.off += int64(n)
+	w.off += int64(len(buf))
 	w.nInBlock++
 	w.count++
 	w.bloom.Add(key)
@@ -309,12 +317,18 @@ func (w *sstWriter) Finish() (*SSTable, error) {
 	}
 	indexOff := w.off
 	idxBuf := encodeIndex(w.index)
-	if _, err := w.f.Write(idxBuf); err != nil {
+	if err := writeFull(w.f, idxBuf); err != nil {
+		_ = w.f.Close()
+		_ = os.Remove(w.tmp)
+		w.f = nil
 		return nil, err
 	}
 	bloomOff := indexOff + int64(len(idxBuf))
 	bloomBuf := w.bloom.Encode()
-	if _, err := w.f.Write(bloomBuf); err != nil {
+	if err := writeFull(w.f, bloomBuf); err != nil {
+		_ = w.f.Close()
+		_ = os.Remove(w.tmp)
+		w.f = nil
 		return nil, err
 	}
 	footer := make([]byte, sstFooterLen)
@@ -324,16 +338,29 @@ func (w *sstWriter) Finish() (*SSTable, error) {
 	binary.LittleEndian.PutUint64(footer[24:32], uint64(len(bloomBuf)))
 	binary.LittleEndian.PutUint64(footer[32:40], w.count)
 	binary.LittleEndian.PutUint64(footer[40:48], sstMagic)
-	if _, err := w.f.Write(footer); err != nil {
+	if err := writeFull(w.f, footer); err != nil {
+		_ = w.f.Close()
+		_ = os.Remove(w.tmp)
+		w.f = nil
 		return nil, err
 	}
 	if err := w.f.Sync(); err != nil {
+		_ = w.f.Close()
+		_ = os.Remove(w.tmp)
+		w.f = nil
 		return nil, err
 	}
 	if err := w.f.Close(); err != nil {
+		_ = os.Remove(w.tmp)
+		w.f = nil
 		return nil, err
 	}
+	w.f = nil
 	if err := os.Rename(w.tmp, w.path); err != nil {
+		_ = os.Remove(w.tmp)
+		return nil, err
+	}
+	if err := syncDir(w.dir); err != nil {
 		return nil, err
 	}
 
@@ -422,7 +449,12 @@ type SSTIterator struct {
 }
 
 func (it *SSTIterator) Next() bool {
-	if it.err != nil || it.remain < 17 {
+	if it.err != nil || it.remain <= 0 {
+		it.valid = false
+		return false
+	}
+	if it.remain < 17 {
+		it.err = io.ErrUnexpectedEOF
 		it.valid = false
 		return false
 	}
