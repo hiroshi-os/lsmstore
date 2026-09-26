@@ -12,3 +12,5 @@ cmd/lsmbench/lsmbench
 /lsmstore
 /lsmctl
 /lsmbench
+bench/*.log
+testdata/

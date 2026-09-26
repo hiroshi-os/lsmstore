@@ -10,9 +10,10 @@ import (
 const manifestName = "MANIFEST"
 
 type manifest struct {
-	NextFileNum uint64        `json:"next_file_num"`
-	LastSeq     uint64        `json:"last_seq"`
-	Levels      [][]TableMeta `json:"levels"`
+	NextFileNum     uint64        `json:"next_file_num"`
+	LastSeq         uint64        `json:"last_seq"`
+	Levels          [][]TableMeta `json:"levels"`
+	ObsoleteWALNums []uint64      `json:"obsolete_wal_nums,omitempty"`
 }
 
 // Version is an immutable snapshot of the SST set. Readers retain a ref so
@@ -109,11 +110,12 @@ func (v *Version) findLevelGE1(key []byte) *SSTable {
 	return nil
 }
 
-func (v *Version) toManifest(nextFile, lastSeq uint64) manifest {
+func (v *Version) toManifest(nextFile, lastSeq uint64, obsoleteWALs []uint64) manifest {
 	m := manifest{
-		NextFileNum: nextFile,
-		LastSeq:     lastSeq,
-		Levels:      make([][]TableMeta, len(v.levels)),
+		NextFileNum:     nextFile,
+		LastSeq:         lastSeq,
+		Levels:          make([][]TableMeta, len(v.levels)),
+		ObsoleteWALNums: append([]uint64(nil), obsoleteWALs...),
 	}
 	for i, lvl := range v.levels {
 		for _, t := range lvl {
@@ -130,10 +132,28 @@ func writeManifest(dir string, m manifest) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	data = append(data, '\n')
+	// fsync the temp file before rename so the new directory entry cannot
+	// point at a zero-length or partial manifest after a crash.
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := writeFull(f, data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func readManifest(dir string) (manifest, error) {

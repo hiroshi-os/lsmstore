@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "cursor/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: gofmt / vet / race / crash
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./... -count=1 -timeout 10m
+
+      - name: short crash test
+        run: LSMSTORE_CRASH_RUNS=20 go test ./internal/lsm/ -run TestCrashKill9 -count=1 -timeout 5m -v

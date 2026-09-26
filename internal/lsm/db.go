@@ -35,6 +35,8 @@ type DB struct {
 	flushErr  error
 	obsolete  []*SSTable
 
+	obsoleteWALs []uint64
+
 	seq      atomic.Uint64
 	nextFile atomic.Uint64
 
@@ -49,7 +51,18 @@ type DB struct {
 	deletes     atomic.Uint64
 	flushes     atomic.Uint64
 	compactions atomic.Uint64
+
+	recovery RecoveryInfo
 }
+
+// RecoveryInfo describes WAL repair performed when the DB was opened.
+type RecoveryInfo struct {
+	TornTails      int   `json:"torn_tails"`
+	TruncatedBytes int64 `json:"truncated_bytes"`
+}
+
+// RecoveryInfo returns WAL tail repairs from the Open that created this DB.
+func (db *DB) RecoveryInfo() RecoveryInfo { return db.recovery }
 
 func Open(opts Options) (*DB, error) {
 	opts = opts.withDefaults()
@@ -81,10 +94,14 @@ func Open(opts Options) (*DB, error) {
 }
 
 func (db *DB) recover() error {
+	if _, err := cleanupTempFiles(db.opts.Dir); err != nil {
+		return err
+	}
 	m, err := readManifest(db.opts.Dir)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	var obsoleteFromManifest []uint64
 	if err == nil {
 		if len(m.Levels) > len(db.version.levels) {
 			db.version.levels = make([][]*SSTable, len(m.Levels))
@@ -100,14 +117,22 @@ func (db *DB) recover() error {
 		}
 		db.seq.Store(m.LastSeq)
 		db.nextFile.Store(m.NextFileNum)
+		obsoleteFromManifest = append([]uint64(nil), m.ObsoleteWALNums...)
 	}
 	if db.nextFile.Load() == 0 {
 		db.nextFile.Store(1)
 	}
 	db.version.retainAll()
 
+	// Drop WALs that a prior flush already published in a durable MANIFEST.
+	// Deleting them here (after SST open succeeds) — not during flush — avoids
+	// losing acknowledged writes if a crash rolls the directory entry back.
+	for _, n := range obsoleteFromManifest {
+		_ = os.Remove(walPath(db.opts.Dir, n))
+	}
+
 	var replayed []uint64
-	maxWAL, err := ReplayWAL(db.opts.Dir, func(rec Record) error {
+	rep, err := ReplayWAL(db.opts.Dir, func(rec Record) error {
 		if rec.Seq > db.seq.Load() {
 			db.seq.Store(rec.Seq)
 		}
@@ -121,11 +146,19 @@ func (db *DB) recover() error {
 	if err != nil {
 		return err
 	}
+	db.recovery = RecoveryInfo{TornTails: rep.TornTails, TruncatedBytes: rep.TruncatedBytes}
 	nums, _ := listWALNums(db.opts.Dir)
 	replayed = nums
 	db.replayed = replayed
-	if maxWAL >= db.nextFile.Load() {
-		db.nextFile.Store(maxWAL + 1)
+	if rep.MaxNum >= db.nextFile.Load() {
+		db.nextFile.Store(rep.MaxNum + 1)
+	}
+	hi, err := maxDataFileNum(db.opts.Dir)
+	if err != nil {
+		return err
+	}
+	if hi >= db.nextFile.Load() {
+		db.nextFile.Store(hi + 1)
 	}
 
 	wal, err := OpenWAL(db.opts.Dir, db.allocFileNum(), db.opts.SyncWAL)
@@ -162,7 +195,7 @@ func (db *DB) Close() error {
 		err = db.wal.Close()
 	}
 	if db.version != nil {
-		_ = writeManifest(db.opts.Dir, db.version.toManifest(db.nextFile.Load(), db.seq.Load()))
+		_ = writeManifest(db.opts.Dir, db.version.toManifest(db.nextFile.Load(), db.seq.Load(), db.obsoleteWALs))
 		db.version.release()
 		db.version = nil
 	}
@@ -455,27 +488,31 @@ func (db *DB) flushOne() error {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	obsolete := append(append([]uint64(nil), db.obsoleteWALs...), imm.walNums...)
+	next := db.version.snapshot(db.opts.MaxLevels)
 	if table != nil {
-		next := db.version.snapshot(db.opts.MaxLevels)
 		next.levels[0] = append(next.levels[0], table)
-		next.retainAll()
-		if err := writeManifest(db.opts.Dir, next.toManifest(db.nextFile.Load(), db.seq.Load())); err != nil {
-			next.release()
-			_ = os.Remove(table.path)
-			return err
-		}
-		old := db.version
-		db.version = next
-		old.release()
 	}
+	next.retainAll()
+	man := next.toManifest(db.nextFile.Load(), db.seq.Load(), obsolete)
+	if err := writeManifest(db.opts.Dir, man); err != nil {
+		next.release()
+		if table != nil {
+			_ = os.Remove(table.path)
+		}
+		return err
+	}
+	old := db.version
+	db.version = next
+	old.release()
+	db.obsoleteWALs = obsolete
 	if len(db.imm) > 0 && db.imm[0] == imm {
 		db.imm = db.imm[1:]
 	}
 	db.flushes.Add(1)
 	db.flushCond.Broadcast()
-	for _, n := range imm.walNums {
-		_ = os.Remove(walPath(db.opts.Dir, n))
-	}
+	// WAL files listed in MANIFEST.ObsoleteWALNums are removed on the next
+	// successful Open after that MANIFEST is observed — never here.
 	db.signal(db.compactCh)
 	return nil
 }
